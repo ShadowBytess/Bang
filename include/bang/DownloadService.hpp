@@ -75,6 +75,7 @@ private:
     std::deque<Job> jobs_;
     ChangeListener listener_;
     bool stopping_ = false;
+    std::stop_source stopSource_;
     std::thread worker_;
 };
 
