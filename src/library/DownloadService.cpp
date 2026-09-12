@@ -49,6 +49,8 @@ DownloadService::DownloadService(LibraryStore& store, TrackImporter& importer,
     , workRoot_(std::move(workRoot))
 {
     std::filesystem::create_directories(workRoot_);
+    // The queue is not resumed across sessions, including after forced termination.
+    store_->clearIncompleteDownloads();
     worker_ = std::thread([this] { workerLoop(); });
 }
 

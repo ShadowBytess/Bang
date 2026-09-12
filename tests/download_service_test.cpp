@@ -3,12 +3,16 @@
 #include "bang/ProcessRunner.hpp"
 
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <string>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -95,6 +99,83 @@ bool runCase(const fs::path& root, const std::string& mode, std::size_t expected
     return ok;
 }
 
+bool checkRestart(const fs::path& root, const std::string& mode, std::size_t expectedCount)
+{
+    bool ok = true;
+    for (int restart = 0; restart < 2; ++restart) {
+        bang::LibraryStore store(root / mode / "data");
+        bang::TrackImporter importer(store);
+        bang::LibraryCatalog catalog(store);
+        bang::DownloadService downloads(store, importer, root / mode / "tmp");
+        const auto history = catalog.recentDownloads();
+        ok &= check(mode == "all-tracks"
+                ? history.size() == 1 && history[0].status == "completed" && history[0].hasTrack
+                : history.empty(),
+            mode + ": restart retains only completed history");
+        ok &= check(downloads.snapshot().empty(), mode + ": restart has an empty queue");
+        const auto tracks = catalog.allTracks();
+        ok &= check(tracks.size() == expectedCount, mode + ": restart preserves imported tracks");
+        for (const auto& listing : tracks) {
+            ok &= check(fs::exists(store.trackFilePath(listing.track)),
+                mode + ": restart preserves audio files");
+        }
+    }
+    return ok;
+}
+
+bool runKilledCase(const fs::path& root, int terminationSignal)
+{
+    const std::string mode = "killed-" + std::to_string(terminationSignal);
+    int ready[2];
+    if (::pipe(ready) != 0) {
+        return check(false, mode + ": create readiness pipe");
+    }
+    const pid_t child = ::fork();
+    if (child == 0) {
+        ::close(ready[0]);
+        bang::LibraryStore store(root / mode / "data");
+        bang::TrackImporter importer(store);
+        bang::DownloadService downloads(store, importer, root / mode / "tmp");
+        downloads.setListener([&] {
+            // Hold the worker before launching a downloader, with another job queued.
+            downloads.enqueue({ "queued" });
+            if (::write(ready[1], "R", 1) != 1) {
+                std::_Exit(1);
+            }
+            while (true) {
+                ::pause();
+            }
+        });
+        downloads.enqueue({ "interrupted" });
+        while (true) {
+            ::pause();
+        }
+    }
+    ::close(ready[1]);
+    if (child < 0) {
+        ::close(ready[0]);
+        return check(false, mode + ": fork download process");
+    }
+    char marker = 0;
+    bool ok = check(::read(ready[0], &marker, 1) == 1 && marker == 'R',
+        mode + ": running and queued jobs are persisted");
+    ::close(ready[0]);
+    ok &= check(::kill(child, terminationSignal) == 0, mode + ": terminate process");
+    int status = 0;
+    ok &= check(::waitpid(child, &status, 0) == child && WIFSIGNALED(status)
+            && WTERMSIG(status) == terminationSignal,
+        mode + ": process died without shutdown cleanup");
+    {
+        bang::LibraryStore store(root / mode / "data");
+        bang::LibraryCatalog catalog(store);
+        const auto history = catalog.recentDownloads();
+        ok &= check(history.size() == 2 && history[0].status == "running"
+                && history[1].status == "running",
+            mode + ": interrupted records survive process death");
+    }
+    return checkRestart(root, mode, 0) && ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -140,6 +221,13 @@ int main(int argc, char** argv)
     ok &= runCase(root, "exit-error", 3);
     ok &= runCase(root, "spotify-nonzero", 0);
     ok &= runCase(root, "spotify-zero", 0);
+    ok &= checkRestart(root, "all-tracks", 3);
+    ok &= checkRestart(root, "missing-second", 2);
+    ok &= checkRestart(root, "exit-error", 3);
+    ok &= checkRestart(root, "spotify-nonzero", 0);
+    ok &= checkRestart(root, "spotify-zero", 0);
+    ok &= runKilledCase(root, SIGTERM);
+    ok &= runKilledCase(root, SIGKILL);
     fs::remove_all(root);
     return ok ? 0 : 1;
 }

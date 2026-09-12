@@ -73,6 +73,7 @@ public:
     void completeDownload(std::int64_t downloadId,
         DownloadStatus status, std::string_view message,
         std::optional<std::int64_t> trackId);
+    void clearIncompleteDownloads();
 
     [[nodiscard]] sqlite3* handle() const { return database_; }
 

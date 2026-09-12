@@ -472,4 +472,11 @@ void LibraryStore::completeDownload(std::int64_t downloadId,
     expectDone(database_, update.get());
 }
 
+void LibraryStore::clearIncompleteDownloads()
+{
+    Statement remove(database_,
+        "DELETE FROM downloads WHERE status IN ('running', 'failed')");
+    expectDone(database_, remove.get());
+}
+
 } // namespace bang
