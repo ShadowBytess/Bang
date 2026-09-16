@@ -1,4 +1,4 @@
-// Thin wrapper around fork/exec for shelling out to yt-dlp, spotdl, and
+// Thin wrapper around fork/exec for shelling out to yt-dlp and ffmpeg.
 // ffmpeg. runStreaming feeds stdout back line by line, which is how
 // DownloadService reads the BANGPCT|/BANGDONE| markers (see
 // library/DownloadParsing.hpp) while a download is in progress.

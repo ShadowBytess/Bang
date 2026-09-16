@@ -84,7 +84,6 @@ struct App {
 
     bool urlDialogOpen = false;
     std::string urlBuffer;
-    bool urlBackendSpotdl = false;
 
     bool searchDialogOpen = false;
     std::string searchBuffer;
@@ -233,20 +232,10 @@ struct App {
         }
     }
 
-    void enqueueUrl(const std::string& url, bool spotdl)
+    void enqueueUrl(const std::string& url)
     {
-        // Auto-detect Spotify links/URIs and force the spotdl backend even
-        // if the URL dialog's backend toggle wasn't flipped, so pasting a
-        // Spotify link always does the right thing by default.
-        if (url.find("open.spotify.com") != std::string::npos
-            || url.find("spotify:") != std::string::npos) {
-            spotdl = true;
-        }
         bang::DownloadService::Request request;
         request.url = url;
-        request.backend =
-            spotdl ? bang::DownloadService::Backend::SpotDl
-                   : bang::DownloadService::Backend::YtDlp;
         downloads.enqueue(std::move(request));
     }
 };
@@ -649,7 +638,7 @@ void drawDialogs(bang::ui::Ui& ui, App& app, float width, float height)
     if (app.urlDialogOpen) {
         dimOverlay();
         const float dw = 520.0f;
-        const float dh = 210.0f;
+        const float dh = 150.0f;
         const float dx = (width - dw) * 0.5f;
         const float dy = (height - dh) * 0.5f;
         dialogFrame(dw, dh);
@@ -658,40 +647,14 @@ void drawDialogs(bang::ui::Ui& ui, App& app, float width, float height)
             bang::text::Weight::Bold, bang::ui::palette::text);
         bool focusOut = false;
         if (ui.textField("urlField", app.urlBuffer,
-                "Paste a YouTube or Spotify link…", dx + 24.0f, dy + 58.0f,
+                "Paste a YouTube link…", dx + 24.0f, dy + 58.0f,
                 dw - 48.0f, 36.0f, focusOut)) {
             if (!app.urlBuffer.empty()) {
-                app.enqueueUrl(app.urlBuffer, app.urlBackendSpotdl);
+                app.enqueueUrl(app.urlBuffer);
                 app.urlBuffer.clear();
                 app.urlDialogOpen = false;
                 return;
             }
-        }
-
-        const float chipY = dy + 110.0f;
-        ui.text("Backend:", dx + 24.0f, chipY + 7.0f, 13.0f,
-            bang::text::Weight::Regular, bang::ui::palette::textDim);
-        const bool ytActive = !app.urlBackendSpotdl;
-        ui.fillRect(dx + 92.0f, chipY, 96.0f, 30.0f,
-            ytActive ? bang::ui::palette::accent : bang::ui::palette::surface,
-            6.0f);
-        ui.text("yt-dlp", dx + 116.0f, chipY + 8.0f, 13.0f,
-            bang::text::Weight::Bold,
-            ytActive ? bang::ui::Color { 0, 0, 0, 1 } : bang::ui::palette::text);
-        if (ui.rowClicked("backendYt", dx + 92.0f, chipY, 96.0f, 30.0f)) {
-            app.urlBackendSpotdl = false;
-        }
-        ui.fillRect(dx + 196.0f, chipY, 96.0f, 30.0f,
-            app.urlBackendSpotdl ? bang::ui::palette::accent
-                                 : bang::ui::palette::surface,
-            6.0f);
-        ui.text("spotdl", dx + 218.0f, chipY + 8.0f, 13.0f,
-            bang::text::Weight::Bold,
-            app.urlBackendSpotdl
-                ? bang::ui::Color { 0, 0, 0, 1 }
-                : bang::ui::palette::text);
-        if (ui.rowClicked("backendSpot", dx + 196.0f, chipY, 96.0f, 30.0f)) {
-            app.urlBackendSpotdl = true;
         }
 
         if (ui.button("urlCancel", "Cancel", dx + 24.0f, dy + dh - 48.0f, 90.0f,
@@ -701,7 +664,7 @@ void drawDialogs(bang::ui::Ui& ui, App& app, float width, float height)
         if (ui.button("urlGo", "Download", dx + dw - 128.0f,
                 dy + dh - 48.0f, 104.0f, 32.0f, true)) {
             if (!app.urlBuffer.empty()) {
-                app.enqueueUrl(app.urlBuffer, app.urlBackendSpotdl);
+                app.enqueueUrl(app.urlBuffer);
                 app.urlBuffer.clear();
                 app.urlDialogOpen = false;
             }

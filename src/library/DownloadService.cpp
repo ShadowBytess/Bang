@@ -8,10 +8,7 @@
 #include <chrono>
 
 // 1 hour timeout below is generous on purpose, large playlists through
-// yt-dlp can genuinely take a while. spotdl progress is much rougher than
-// yt-dlp's: it has no machine-readable progress output, so runJob() just
-// bumps progressPercent by 25 each time it sees a "Downloaded" line in
-// spotdl's stdout, capped at 95 until the process actually exits.
+// yt-dlp can genuinely take a while.
 namespace bang {
 
 namespace {
@@ -36,11 +33,6 @@ std::string trimToLimit(std::string text)
 }
 
 } // namespace
-
-const char* DownloadService::backendName(Backend backend)
-{
-    return backend == Backend::YtDlp ? "yt-dlp" : "spotdl";
-}
 
 DownloadService::DownloadService(LibraryStore& store, TrackImporter& importer,
     std::filesystem::path workRoot)
@@ -81,8 +73,7 @@ void DownloadService::enqueue(Request request)
     job.label = job.request.url;
     {
         std::lock_guard lock(mutex_);
-        job.recordId = store_->beginDownload(
-            job.request.url, backendName(job.request.backend));
+        job.recordId = store_->beginDownload(job.request.url, "yt-dlp");
         jobs_.push_back(std::move(job));
     }
     signal_.notify_one();
@@ -157,17 +148,15 @@ void DownloadService::workerLoop()
 void DownloadService::runJob(Job& job)
 {
     const std::string url = job.request.url;
-    const Backend backend = job.request.backend;
 
     std::filesystem::path workDirectory =
         workRoot_ / ("job-" + std::to_string(job.recordId));
     std::filesystem::create_directories(workDirectory);
 
-    const auto program = ProcessRunner::findExecutable(backendName(backend));
+    const auto program = ProcessRunner::findExecutable("yt-dlp");
     if (!program.has_value()) {
         job.state = State::Failed;
-        job.message = std::string(backendName(backend))
-            + " is not installed or not on PATH";
+        job.message = "yt-dlp is not installed or not on PATH";
         store_->completeDownload(job.recordId,
             DownloadStatus::Failed, job.message, std::nullopt);
         publish();
@@ -183,16 +172,7 @@ void DownloadService::runJob(Job& job)
     std::vector<download::DoneItem> doneItems;
     double lastProgress = 0.0;
 
-    if (backend == Backend::YtDlp) {
-        options.arguments = download::ytDlpArguments(url, workDirectory);
-    } else {
-        const std::filesystem::path outputTemplate =
-            workDirectory / "{artists} - {title}.{output-ext}";
-        options.arguments = {
-            "download", url, "--format", "mp3",
-            "--output", outputTemplate.string(),
-        };
-    }
+    options.arguments = download::ytDlpArguments(url, workDirectory);
 
     const ProcessResult result = ProcessRunner::runStreaming(options,
         [&](std::string_view lineText) {
@@ -218,28 +198,8 @@ void DownloadService::runJob(Job& job)
                 }
                 publish();
                 break;
-            case download::LineKind::Other: {
-                bool spotdlUpdate = false;
-                if (backend == Backend::SpotDl) {
-                    const auto downloaded = line.find("Downloaded \"");
-                    if (downloaded != std::string::npos) {
-                        const auto titleStart = downloaded + 12;
-                        const auto titleEnd = line.find('"', titleStart);
-                        std::lock_guard lock(mutex_);
-                        if (titleEnd != std::string::npos) {
-                            job.label = line.substr(
-                                titleStart, titleEnd - titleStart);
-                        }
-                        job.progressPercent = std::min(
-                            job.progressPercent + 25.0, 95.0);
-                        spotdlUpdate = true;
-                    }
-                }
-                if (spotdlUpdate) {
-                    publish();
-                }
+            case download::LineKind::Other:
                 break;
-            }
             }
         });
 
@@ -259,34 +219,33 @@ void DownloadService::runJob(Job& job)
             ? "download timed out"
             : diagnosticOutput();
         if (failureMessage.empty()) {
-            failureMessage = std::string(backendName(backend))
-                + " exited with status " + std::to_string(result.exitCode);
+            failureMessage = "yt-dlp exited with status "
+                + std::to_string(result.exitCode);
         }
     }
 
     std::vector<std::filesystem::path> sources;
-    if (backend == Backend::YtDlp && !doneItems.empty()) {
+    if (!doneItems.empty()) {
         for (const auto& item : doneItems) {
             sources.push_back(item.filePath);
         }
-    } else if (result.succeeded() || (backend == Backend::SpotDl && !result.timedOut)) {
+    } else if (result.succeeded()) {
         sources = collectAudioFiles(workDirectory);
     }
 
-    const std::string sourceTag = backend == Backend::YtDlp ? "youtube" : "spotify";
     for (std::size_t index = 0; index < sources.size(); ++index) {
         if (stopSource_.stop_requested()) {
             failureMessage = "download cancelled";
             break;
         }
         AudioMetadata overrides;
-        if (backend == Backend::YtDlp && index < doneItems.size()) {
+        if (index < doneItems.size()) {
             overrides.title = doneItems[index].title;
             overrides.artist = doneItems[index].uploader;
         }
         try {
             const TrackImporter::Result imported =
-                importer_->importFile(sources[index], overrides, sourceTag, url);
+                importer_->importFile(sources[index], overrides, "youtube", url);
             importedTracks.push_back(imported.track);
         } catch (const std::exception& error) {
             if (failureMessage.empty()) {
