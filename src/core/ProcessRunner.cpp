@@ -11,12 +11,13 @@
 #include <cerrno>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 // Raw POSIX fork/pipe/poll/waitpid, no popen(). execute() is the one real
 // function here: forks, redirects stdout/stderr to pipes, polls both with a
 // 250ms tick so the overall timeout can be enforced, and on timeout sends
-// SIGTERM then SIGKILL if the child doesn't die within 2s. If this needs
+// SIGTERM then SIGKILL to the process group on timeout or cancellation. If this needs
 // debugging, the child side (pid == 0 branch) only has _exit, never a
 // normal return, that's deliberate so we don't run C++ destructors twice.
 namespace bang {
@@ -95,6 +96,11 @@ ProcessResult ProcessRunner::runStreaming(
 
 ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& sink)
 {
+    ProcessResult result;
+    if (options.stopToken.stop_requested()) {
+        result.cancelled = true;
+        return result;
+    }
     int standardOutputPipe[2];
     int errorOutputPipe[2];
     if (::pipe(standardOutputPipe) != 0 || ::pipe(errorOutputPipe) != 0) {
@@ -122,6 +128,9 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
     }
 
     if (pid == 0) {
+        if (::setpgid(0, 0) != 0) {
+            _exit(126);
+        }
         const int devNull = ::open("/dev/null", O_RDONLY);
         if (devNull >= 0) {
             ::dup2(devNull, STDIN_FILENO);
@@ -146,11 +155,13 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
         _exit(127);
     }
 
+    // Also establish the group in the parent so cancellation cannot race exec.
+    ::setpgid(pid, pid);
+
     ::close(standardOutputPipe[1]);
     ::close(errorOutputPipe[1]);
 
     int readFds[2] = {standardOutputPipe[0], errorOutputPipe[0]};
-    ProcessResult result;
     std::string pendingStandardLine;
 
     const auto deadline = std::chrono::steady_clock::now() + options.timeout;
@@ -192,7 +203,7 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
 
     while (!childrenStreamsClosed) {
         const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
+        if (options.stopToken.stop_requested() || now >= deadline) {
             break;
         }
         const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -260,13 +271,18 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
         pendingStandardLine.clear();
     }
 
-    const auto waitForExit = [&](int milliseconds) {
+    bool reaped = false;
+    const auto waitForExit = [&](int milliseconds, bool cancellable) {
         const auto limit = std::chrono::steady_clock::now()
             + std::chrono::milliseconds(milliseconds);
         while (true) {
+            if (reaped) {
+                return true;
+            }
             int status = 0;
             const pid_t done = ::waitpid(pid, &status, WNOHANG);
             if (done == pid) {
+                reaped = true;
                 if (WIFEXITED(status)) {
                     result.exitCode = WEXITSTATUS(status);
                 } else if (WIFSIGNALED(status)) {
@@ -275,9 +291,11 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
                 return true;
             }
             if (done < 0 && errno != EINTR) {
+                reaped = true;
                 return true;
             }
-            if (std::chrono::steady_clock::now() >= limit) {
+            if ((cancellable && options.stopToken.stop_requested())
+                || std::chrono::steady_clock::now() >= limit) {
                 return false;
             }
             struct timespec pause{0, 20 * 1000 * 1000};
@@ -288,13 +306,22 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
     const auto remaining = std::max<std::int64_t>(0,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count());
-    if (!waitForExit(static_cast<int>(remaining))) {
-        result.timedOut = true;
-        ::kill(pid, SIGTERM);
-        if (!waitForExit(2000)) {
-            ::kill(pid, SIGKILL);
-            waitForExit(2000);
+    const bool exited = waitForExit(static_cast<int>(remaining), true);
+    result.cancelled = options.stopToken.stop_requested();
+    result.timedOut = !result.cancelled && (!exited || !childrenStreamsClosed);
+    if (result.cancelled || result.timedOut) {
+        // yt-dlp and spotdl can leave ffmpeg or other descendants behind.
+        ::kill(-pid, SIGTERM);
+        const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (::kill(-pid, 0) == 0 && std::chrono::steady_clock::now() < grace) {
+            waitForExit(0, false);
+            if (::kill(-pid, 0) != 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        ::kill(-pid, SIGKILL);
+        waitForExit(2000, false);
     }
 
     return result;

@@ -842,6 +842,8 @@ int main()
         LibraryStore store(dataDirectory());
         LibraryCatalog catalog(store);
         TrackImporter importer(store);
+        // The listener target must outlive the download worker, including on exceptions.
+        std::atomic<bool> libraryDirty { true };
         DownloadService downloads(store, importer, temporaryDirectory());
         SearchService searchService;
         Player player;
@@ -855,7 +857,6 @@ int main()
             jetbrains_mono_bold_size());
         ui::Ui ui(renderer, textEngine);
 
-        std::atomic<bool> libraryDirty { true };
         downloads.setListener([&libraryDirty] { libraryDirty.store(true); });
 
         window.setEvents(platform::WindowEvents {

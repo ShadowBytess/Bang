@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,10 +19,11 @@ namespace bang {
 struct ProcessResult {
     int exitCode = -1;
     bool timedOut = false;
+    bool cancelled = false;
     std::string standardOutput;
     std::string errorOutput;
 
-    [[nodiscard]] bool succeeded() const { return exitCode == 0 && !timedOut; }
+    [[nodiscard]] bool succeeded() const { return exitCode == 0 && !timedOut && !cancelled; }
 };
 
 struct RunOptions {
@@ -29,6 +31,7 @@ struct RunOptions {
     std::vector<std::string> arguments;
     std::optional<std::filesystem::path> workingDirectory;
     std::chrono::milliseconds timeout{600000};
+    std::stop_token stopToken;
 };
 
 class ProcessRunner {

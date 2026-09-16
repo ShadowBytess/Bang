@@ -10,6 +10,7 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -26,6 +27,11 @@ bool check(bool condition, const std::string& name)
 
 int runDownloader(const std::string& mode)
 {
+    if (mode == "slow") {
+        std::cout << "BANGPCT|1" << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        return 0;
+    }
     if (mode.starts_with("spotify-")) {
         std::cout << "AudioProviderError: no matching audio found\n";
         return mode == "spotify-zero" ? 0 : 1;
@@ -121,6 +127,44 @@ bool checkRestart(const fs::path& root, const std::string& mode, std::size_t exp
         }
     }
     return ok;
+}
+
+bool runCloseCase(const fs::path& root)
+{
+    bang::LibraryStore store(root / "close" / "data");
+    bang::TrackImporter importer(store);
+    std::mutex mutex;
+    std::condition_variable signal;
+    bool started = false;
+    auto downloads = std::make_unique<bang::DownloadService>(store, importer,
+        root / "close" / "tmp");
+    downloads->setListener([&] {
+        const auto jobs = downloads->snapshot();
+        if (!jobs.empty() && jobs[0].progressPercent > 0) {
+            std::lock_guard lock(mutex);
+            started = true;
+            signal.notify_one();
+        }
+    });
+    downloads->enqueue({ "slow" });
+    downloads->enqueue({ "all-tracks" });
+    {
+        std::unique_lock lock(mutex);
+        if (!signal.wait_for(lock, std::chrono::seconds(5), [&] { return started; })) {
+            std::cerr << "FAIL close: downloader did not start\n";
+            std::_Exit(1);
+        }
+    }
+    downloads->setListener({});
+    const auto start = std::chrono::steady_clock::now();
+    downloads.reset();
+    bool ok = check(std::chrono::steady_clock::now() - start < std::chrono::seconds(1),
+        "close: cancel active download promptly");
+    ok &= check(fs::is_empty(root / "close" / "tmp"),
+        "close: remove interrupted job files");
+    ok &= check(bang::LibraryCatalog(store).allTracks().empty(),
+        "close: do not run queued downloads");
+    return checkRestart(root, "close", 0) && ok;
 }
 
 bool runKilledCase(const fs::path& root, int terminationSignal)
@@ -228,6 +272,7 @@ int main(int argc, char** argv)
     ok &= checkRestart(root, "spotify-zero", 0);
     ok &= runKilledCase(root, SIGTERM);
     ok &= runKilledCase(root, SIGKILL);
+    ok &= runCloseCase(root);
     fs::remove_all(root);
     return ok ? 0 : 1;
 }

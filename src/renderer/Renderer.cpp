@@ -67,7 +67,7 @@ struct Renderer::Impl {
     VkCommandPool commandPool = nullptr;
     VkCommandBuffer commandBuffer = nullptr;
     VkSemaphore imageAvailable = nullptr;
-    VkSemaphore renderFinished = nullptr;
+    std::vector<VkSemaphore> renderFinished;
     VkFence frameFence = nullptr;
 
     VkBuffer cornerBuffer = nullptr;
@@ -132,6 +132,14 @@ struct Renderer::Impl {
         VkBuffer buffer = nullptr;
         VkDeviceMemory memory = nullptr;
     };
+    BufferAllocation uploadStaging;
+
+    void releaseUploadStaging()
+    {
+        vkDestroyBuffer(device, uploadStaging.buffer, nullptr);
+        vkFreeMemory(device, uploadStaging.memory, nullptr);
+        uploadStaging = {};
+    }
 
     BufferAllocation allocateBuffer(std::size_t bytes,
         VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) const
@@ -183,7 +191,7 @@ struct Renderer::Impl {
     void createFixedBuffers();
     void createPipeline();
     void ensureInstanceCapacity(std::size_t count);
-    void flushUploads();
+    void recordUploads();
 };
 
 void Renderer::Impl::createInstance()
@@ -326,6 +334,11 @@ void Renderer::Impl::pickDevice()
 
 void Renderer::Impl::destroySwapchainObjects()
 {
+    vkDeviceWaitIdle(device);
+    for (const VkSemaphore semaphore : renderFinished) {
+        vkDestroySemaphore(device, semaphore, nullptr);
+    }
+    renderFinished.clear();
     for (const VkImageView view : swapchainViews) {
         vkDestroyImageView(device, view, nullptr);
     }
@@ -407,6 +420,19 @@ void Renderer::Impl::createSwapchain()
     vkGetSwapchainImagesKHR(device, swapchain, &actualCount, nullptr);
     swapchainImages.resize(actualCount);
     vkGetSwapchainImagesKHR(device, swapchain, &actualCount, swapchainImages.data());
+
+    // Reacquiring an image retires its previous presentation semaphore wait.
+    // The frame fence only covers rendering, not presentation.
+    renderFinished.resize(actualCount);
+    VkSemaphoreCreateInfo semaphoreInfo {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    };
+    for (VkSemaphore& semaphore : renderFinished) {
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &semaphore)
+            != VK_SUCCESS) {
+            fail("vkCreateSemaphore(present)");
+        }
+    }
 
     for (const VkImage image : swapchainImages) {
         VkImageViewCreateInfo viewInfo {
@@ -743,9 +769,7 @@ void Renderer::Impl::createPipeline()
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
     };
     if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailable)
-            != VK_SUCCESS
-        || vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinished)
-            != VK_SUCCESS) {
+        != VK_SUCCESS) {
         fail("vkCreateSemaphore");
     }
     VkFenceCreateInfo fenceInfo { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -755,7 +779,7 @@ void Renderer::Impl::createPipeline()
     }
 }
 
-void Renderer::Impl::flushUploads()
+void Renderer::Impl::recordUploads()
 {
     if (pendingUploads.empty()) {
         return;
@@ -765,14 +789,14 @@ void Renderer::Impl::flushUploads()
         stagingSize += static_cast<VkDeviceSize>(upload.pixels.size());
     }
 
-    const auto staging =
+    uploadStaging =
         allocateBuffer(static_cast<std::size_t>(stagingSize),
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                 | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     void* mapped = nullptr;
-    if (vkMapMemory(device, staging.memory, 0, stagingSize, 0, &mapped)
+    if (vkMapMemory(device, uploadStaging.memory, 0, stagingSize, 0, &mapped)
         != VK_SUCCESS) {
         fail("vkMapMemory(staging)");
     }
@@ -782,20 +806,11 @@ void Renderer::Impl::flushUploads()
             upload.pixels.data(), upload.pixels.size());
         offset += static_cast<VkDeviceSize>(upload.pixels.size());
     }
-    vkUnmapMemory(device, staging.memory);
-
-    vkResetCommandBuffer(commandBuffer, 0);
-    VkCommandBufferBeginInfo beginInfo {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
-    };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
-        fail("vkBeginCommandBuffer");
-    }
+    vkUnmapMemory(device, uploadStaging.memory);
 
     VkImageMemoryBarrier toTransfer { .sType =
             VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    toTransfer.srcAccessMask = 0;
+    toTransfer.srcAccessMask = atlasInitialized ? VK_ACCESS_SHADER_READ_BIT : 0;
     toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toTransfer.oldLayout = atlasInitialized
         ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
@@ -818,7 +833,7 @@ void Renderer::Impl::flushUploads()
         copy.imageOffset = { upload.x, upload.y, 0 };
         copy.imageExtent = { static_cast<std::uint32_t>(upload.width),
             static_cast<std::uint32_t>(upload.height), 1 };
-        vkCmdCopyBufferToImage(commandBuffer, staging.buffer, atlasImage,
+        vkCmdCopyBufferToImage(commandBuffer, uploadStaging.buffer, atlasImage,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         offset += static_cast<VkDeviceSize>(upload.pixels.size());
     }
@@ -832,53 +847,6 @@ void Renderer::Impl::flushUploads()
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
         &toShaderRead);
 
-    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
-        fail("vkEndCommandBuffer");
-    }
-    VkSubmitInfo submit { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &commandBuffer;
-
-    // vkQueueWaitIdle has no timeout and cannot fail with VK_TIMEOUT - if the
-    // queue is stalled (e.g. present blocked because the window isn't
-    // currently visible to the compositor) it blocks forever, freezing the
-    // whole single-threaded app. Submit with a dedicated fence and wait on
-    // that with a bounded timeout instead, so a stall here just delays this
-    // glyph upload rather than hanging the app.
-    VkFenceCreateInfo uploadFenceInfo {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
-    };
-    VkFence uploadFence = VK_NULL_HANDLE;
-    if (vkCreateFence(device, &uploadFenceInfo, nullptr, &uploadFence)
-        != VK_SUCCESS) {
-        fail("vkCreateFence(upload)");
-    }
-
-    if (vkQueueSubmit(queue, 1, &submit, uploadFence) != VK_SUCCESS) {
-        vkDestroyFence(device, uploadFence, nullptr);
-        fail("vkQueueSubmit(upload)");
-    }
-
-    constexpr std::uint64_t uploadTimeoutNs = 1'000'000'000ULL; // 1 second
-    const VkResult uploadWait =
-        vkWaitForFences(device, 1, &uploadFence, VK_TRUE, uploadTimeoutNs);
-    vkDestroyFence(device, uploadFence, nullptr);
-    if (uploadWait != VK_SUCCESS) {
-        // Timed out or failed: the submitted commands may still be in
-        // flight on the GPU, so it's not safe to destroy the staging buffer
-        // or reset commandBuffer here (that's undefined behavior against a
-        // resource still in use). Intentionally leak the staging buffer
-        // rather than risk corrupting a live GPU submission; this path
-        // should only be hit when the compositor is genuinely not
-        // presenting the window, which is rare. Leave pendingUploads
-        // intact so the glyph data isn't lost - it'll be retried once the
-        // queue is unstuck (subsequent flushUploads() calls will build a
-        // fresh staging buffer and commandBuffer state).
-        return;
-    }
-
-    vkDestroyBuffer(device, staging.buffer, nullptr);
-    vkFreeMemory(device, staging.memory, nullptr);
     pendingUploads.clear();
     atlasInitialized = true;
 }
@@ -905,10 +873,9 @@ Renderer::~Renderer()
     if (impl_ == nullptr) {
         return;
     }
-    vkDeviceWaitIdle(impl_->device);
     impl_->destroySwapchainObjects();
+    impl_->releaseUploadStaging();
     vkDestroyFence(impl_->device, impl_->frameFence, nullptr);
-    vkDestroySemaphore(impl_->device, impl_->renderFinished, nullptr);
     vkDestroySemaphore(impl_->device, impl_->imageAvailable, nullptr);
     vkDestroyCommandPool(impl_->device, impl_->commandPool, nullptr);
     vkDestroyDescriptorPool(impl_->device, impl_->descriptorPool, nullptr);
@@ -979,6 +946,16 @@ void Renderer::uploadAtlas(const AtlasRegion& region, int width, int height,
 
 bool Renderer::render(std::vector<Instance> instances)
 {
+    // Uploads and drawing share this fence and command buffer. A timeout
+    // leaves both untouched until the GPU finishes the submission.
+    constexpr std::uint64_t frameTimeoutNs = 1'000'000'000ULL;
+    const VkResult waitResult = vkWaitForFences(
+        impl_->device, 1, &impl_->frameFence, VK_TRUE, frameTimeoutNs);
+    if (waitResult != VK_SUCCESS) {
+        return false;
+    }
+    impl_->releaseUploadStaging();
+
     if ((impl_->extent.width == 0 || impl_->extent.height == 0
             || impl_->swapchainDirty)
         && impl_->swapchain != nullptr) {
@@ -993,8 +970,6 @@ bool Renderer::render(std::vector<Instance> instances)
         }
     }
 
-    impl_->flushUploads();
-
     // Bounded timeout instead of UINT64_MAX: under FIFO present mode these
     // calls only get signaled once the compositor actually consumes a
     // presented frame. If the window is minimized, occluded, or the
@@ -1003,17 +978,6 @@ bool Renderer::render(std::vector<Instance> instances)
     // the compositor's responsiveness ping - which is what produces the
     // "not responding" prompt. Timing out just skips this frame; we retry
     // on the next loop iteration once dispatch has had a chance to run.
-    constexpr std::uint64_t frameTimeoutNs = 1'000'000'000ULL; // 1 second
-
-    const VkResult waitResult = vkWaitForFences(
-        impl_->device, 1, &impl_->frameFence, VK_TRUE, frameTimeoutNs);
-    if (waitResult == VK_TIMEOUT) {
-        return false;
-    }
-    if (waitResult != VK_SUCCESS) {
-        return false;
-    }
-
     std::uint32_t imageIndex = 0;
     const VkResult acquire = vkAcquireNextImageKHR(impl_->device,
         impl_->swapchain, frameTimeoutNs, impl_->imageAvailable, nullptr,
@@ -1034,6 +998,7 @@ bool Renderer::render(std::vector<Instance> instances)
     if (vkBeginCommandBuffer(impl_->commandBuffer, &beginInfo) != VK_SUCCESS) {
         return false;
     }
+    impl_->recordUploads();
 
     VkClearValue clearValue {};
     clearValue.color.float32[0] = 0.055f;
@@ -1069,7 +1034,7 @@ bool Renderer::render(std::vector<Instance> instances)
     toAttachment.image = impl_->swapchainImages[imageIndex];
     toAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCmdPipelineBarrier(impl_->commandBuffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
         nullptr, 1, &toAttachment);
 
@@ -1152,7 +1117,7 @@ bool Renderer::render(std::vector<Instance> instances)
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &impl_->commandBuffer;
     submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &impl_->renderFinished;
+    submit.pSignalSemaphores = &impl_->renderFinished[imageIndex];
     const VkResult submitResult = vkQueueSubmit(impl_->queue, 1, &submit, impl_->frameFence);
     if (submitResult != VK_SUCCESS) {
         std::fprintf(stderr, "bang: vkQueueSubmit=%d\n", (int)submitResult);
@@ -1161,7 +1126,7 @@ bool Renderer::render(std::vector<Instance> instances)
 
     VkPresentInfoKHR present { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &impl_->renderFinished;
+    present.pWaitSemaphores = &impl_->renderFinished[imageIndex];
     present.swapchainCount = 1;
     present.pSwapchains = &impl_->swapchain;
     present.pImageIndices = &imageIndex;

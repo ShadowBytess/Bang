@@ -59,7 +59,9 @@ DownloadService::~DownloadService()
     {
         std::lock_guard lock(mutex_);
         stopping_ = true;
+        listener_ = {};
     }
+    stopSource_.request_stop();
     signal_.notify_all();
     if (worker_.joinable()) {
         worker_.join();
@@ -175,6 +177,7 @@ void DownloadService::runJob(Job& job)
     RunOptions options;
     options.program = *program;
     options.timeout = downloadTimeout;
+    options.stopToken = stopSource_.get_token();
     options.workingDirectory = workDirectory;
 
     std::vector<download::DoneItem> doneItems;
@@ -251,7 +254,8 @@ void DownloadService::runJob(Job& job)
     };
 
     if (!result.succeeded()) {
-        failureMessage = result.timedOut
+        failureMessage = result.cancelled ? "download cancelled"
+            : result.timedOut
             ? "download timed out"
             : diagnosticOutput();
         if (failureMessage.empty()) {
@@ -271,6 +275,10 @@ void DownloadService::runJob(Job& job)
 
     const std::string sourceTag = backend == Backend::YtDlp ? "youtube" : "spotify";
     for (std::size_t index = 0; index < sources.size(); ++index) {
+        if (stopSource_.stop_requested()) {
+            failureMessage = "download cancelled";
+            break;
+        }
         AudioMetadata overrides;
         if (backend == Backend::YtDlp && index < doneItems.size()) {
             overrides.title = doneItems[index].title;
