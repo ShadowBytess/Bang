@@ -1,6 +1,6 @@
 // Background download queue backed by a single worker thread. enqueue()
 // just records a job and wakes the worker, runJob() does the real work:
-// shell out to yt-dlp/spotdl, parse progress off stdout, import whatever
+// shell out to yt-dlp, parse progress off stdout, import whatever
 // audio comes out, then delete the temp job directory.
 // NOTE: if a single URL is a playlist and produces multiple tracks, only
 // the FIRST imported track's id gets linked to the downloads row
@@ -26,11 +26,8 @@ namespace bang {
 
 class DownloadService {
 public:
-    enum class Backend { YtDlp, SpotDl };
-
     struct Request {
         std::string url;
-        Backend backend = Backend::YtDlp;
     };
 
     enum class State { Queued, Running, Completed, Failed };
@@ -56,8 +53,6 @@ public:
     void enqueue(Request request);
 
     [[nodiscard]] std::vector<Job> snapshot() const;
-
-    [[nodiscard]] static const char* backendName(Backend backend);
 
 private:
     void workerLoop();

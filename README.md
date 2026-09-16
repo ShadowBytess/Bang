@@ -1,7 +1,7 @@
 # Bang
 
 Bang is a native C++23 music application for Wayland. It acquires music -
-paste a YouTube or Spotify link, or search YouTube from inside the app -
+paste a YouTube link, or search YouTube from inside the app -
 stores normal audio as `.mp3` files with embedded tags and cover art, while preserving tracker `.mod` files, and plays
 it back from an indexed local library with playlists and favorites.
 
@@ -21,9 +21,9 @@ Install the following development dependencies before configuring:
 - SQLite, TagLib, and GStreamer 1.20 or newer (`gst-plugins-base` and
   `gst-plugins-good` at runtime for MP3 decoding and a GStreamer plugin capable of MOD/tracker playback for `.mod` files);
 - FreeType, HarfBuzz, and xkbcommon; and
-- the external acquisition tools on `PATH`: `yt-dlp`, `spotdl`, and
-  `ffmpeg` (both backends shell out to them and to ffmpeg for MP3
-  extraction and thumbnail conversion).
+- the external acquisition tools on `PATH`: `yt-dlp` and `ffmpeg` (the
+  download backend shells out to them, and to ffmpeg for MP3 extraction
+  and thumbnail conversion).
 
 The build downloads checksum-pinned JetBrains Mono sources and embeds the
 regular and bold faces, plus the compiled SPIR-V shaders, in the Bang
@@ -47,7 +47,7 @@ when it is installed.
 - `src/app/` composes the application: screens, dialogs, player bar.
 - `src/library/` owns the domain: the SQLite store and catalog, the
   content-addressed track importer, TagLib metadata, the download service
-  with its yt-dlp/spotdl backends, and YouTube search.
+  and its yt-dlp backend, and YouTube search.
 - `src/playback/` wraps GStreamer `playbin` playback.
 - Playlist import/export supports M3U/M3U8 files, including local `.MOD` tracker files.
 
@@ -77,7 +77,7 @@ deduplicated by hash, never re-copied.
 ## Status
 
 Working: library with live filter, playlists, favorites, download queue
-with progress, YouTube search dialog, add-by-URL with backend choice,
+with progress, YouTube search dialog, add-by-URL,
 playback with seek/volume, auto-tagging with embedded artwork.
 
 Planned: album/artist grouping, MPRIS desktop controls, drag-to-reorder

@@ -310,7 +310,7 @@ ProcessResult ProcessRunner::execute(const RunOptions& options, const LineSink& 
     result.cancelled = options.stopToken.stop_requested();
     result.timedOut = !result.cancelled && (!exited || !childrenStreamsClosed);
     if (result.cancelled || result.timedOut) {
-        // yt-dlp and spotdl can leave ffmpeg or other descendants behind.
+        // yt-dlp can leave ffmpeg or other descendants behind.
         ::kill(-pid, SIGTERM);
         const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (::kill(-pid, 0) == 0 && std::chrono::steady_clock::now() < grace) {
